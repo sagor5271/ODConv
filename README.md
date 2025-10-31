@@ -1,2 +1,0 @@
-# ODConv
-pneumonia-xray-images 
