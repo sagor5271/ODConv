@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
 # ============================
 # STABLE ATTENTION
 # ============================
@@ -53,39 +52,39 @@ class Attention(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = self.avg(x)
-        x = self.relu(self.bn(self.fc1(x)))
+        B, C, H, W = x.size()
+        x_avg = self.avg(x)
+        x_fc = self.relu(self.bn(self.fc1(x_avg)))
 
-        # channel attn
-        ch = torch.sigmoid(self.fc_channel(x) / (self.temperature * 2))
-        ch = torch.clamp(ch, 0.01, 0.99)  # prevent explode
+        # channel attention
+        ch = torch.sigmoid(self.fc_channel(x_fc) / (self.temperature * 2))
+        ch = torch.clamp(ch, 0.01, 0.99)
 
-        # filter attn
+        # filter attention
         if self.fc_filter is None:
             fl = 1.0
         else:
-            fl = torch.sigmoid(self.fc_filter(x) / (self.temperature * 2))
+            fl = torch.sigmoid(self.fc_filter(x_fc) / (self.temperature * 2))
             fl = torch.clamp(fl, 0.01, 0.99)
 
-        # spatial attn
+        # spatial attention
         if self.fc_spatial is None:
             sp = 1.0
         else:
-            sp = self.fc_spatial(x)
-            sp = sp.view(x.size(0), 1, 1, 1, self.kernel_size, self.kernel_size)
+            sp = self.fc_spatial(x_fc)
+            sp = sp.view(B, 1, 1, 1, self.kernel_size, self.kernel_size)
             sp = torch.sigmoid(sp / (self.temperature * 2))
             sp = torch.clamp(sp, 0.01, 0.99)
 
-        # kernel attn
+        # kernel attention
         if self.fc_kernel is None:
             ke = 1.0
         else:
-            ke = self.fc_kernel(x)
-            ke = ke.view(x.size(0), self.kernel_num, 1, 1, 1, 1)
+            ke = self.fc_kernel(x_fc)
+            ke = ke.view(B, self.kernel_num, 1, 1, 1, 1)
             ke = F.softmax(ke / (self.temperature * 2), dim=1)
 
         return ch, fl, sp, ke
-
 
 # ============================
 # STABLE ODConv2d
@@ -114,29 +113,31 @@ class ODConv2d(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.size()
-
         ch, fl, sp, ke = self.attn(x)
 
         # channel apply
         x = x * ch
-
         x = x.reshape(1, B * C, H, W)
 
+        # convert float to tensor if necessary
+        device = x.device
+        dtype = x.dtype
+        if isinstance(sp, float):
+            sp = torch.ones(B, 1, 1, 1, self.kernel_size, self.kernel_size, device=device, dtype=dtype)
+        if isinstance(ke, float):
+            ke = torch.ones(B, self.kernel_num, 1, 1, 1, 1, device=device, dtype=dtype)
+
         # dynamic weight fusion
-        if isinstance(sp, float) and isinstance(ke, float):
-            # simple case (1x1conv)
-            agg_w = self.weight[0]
-        else:
-            agg_w = sp * ke * self.weight.unsqueeze(0)
-            agg_w = agg_w.sum(1)  # sum kernels
-            agg_w = agg_w / self.kernel_num  # normalize scale
+        agg_w = sp * ke * self.weight.unsqueeze(0)
+        agg_w = agg_w.sum(1)  # sum kernels
+        agg_w = agg_w / self.kernel_num  # normalize scale
 
         agg_w = agg_w.view(B * self.out_planes,
                            self.in_planes // self.groups,
                            self.kernel_size,
                            self.kernel_size)
 
-        # conv
+        # convolution
         out = F.conv2d(
             x, agg_w, stride=self.stride, padding=self.padding,
             dilation=self.dilation, groups=self.groups * B
@@ -145,7 +146,8 @@ class ODConv2d(nn.Module):
         out = out.view(B, self.out_planes, out.size(-2), out.size(-1))
 
         # filter attention
-        if not isinstance(fl, float):
-            out = out * fl
+        if isinstance(fl, float):
+            fl = torch.ones_like(out, device=device, dtype=dtype)
+        out = out * fl
 
         return out
