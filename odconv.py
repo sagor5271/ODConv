@@ -1,142 +1,151 @@
-# ODConv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.autograd
+import math
 
 
+# ============================
+# STABLE ATTENTION
+# ============================
 class Attention(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, groups=1, reduction=0.0625, kernel_num=4, min_channel=16):
-        super(Attention, self).__init__()
-        attention_channel = max(int(in_planes * reduction), min_channel)
+    def __init__(self, in_planes, out_planes, kernel_size,
+                 groups=1, reduction=0.0625, kernel_num=4, min_channel=16):
+        super().__init__()
+
+        attn_ch = max(int(in_planes * reduction), min_channel)
         self.kernel_size = kernel_size
         self.kernel_num = kernel_num
         self.temperature = 1.0
 
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Conv2d(in_planes, attention_channel, 1, bias=False)
-        self.bn = nn.BatchNorm2d(attention_channel)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(in_planes, attn_ch, 1, bias=False)
+        self.bn = nn.BatchNorm2d(attn_ch)
         self.relu = nn.ReLU(inplace=True)
 
-        self.channel_fc = nn.Conv2d(attention_channel, in_planes, 1, bias=True)
-        self.func_channel = self.get_channel_attention
+        # channel attention
+        self.fc_channel = nn.Conv2d(attn_ch, in_planes, 1)
 
-        if in_planes == groups and in_planes == out_planes:  # depth-wise convolution
-            self.func_filter = self.skip
+        # filter attention
+        if in_planes == groups and in_planes == out_planes:
+            self.fc_filter = None
         else:
-            self.filter_fc = nn.Conv2d(attention_channel, out_planes, 1, bias=True)
-            self.func_filter = self.get_filter_attention
+            self.fc_filter = nn.Conv2d(attn_ch, out_planes, 1)
 
-        if kernel_size == 1:  # point-wise convolution
-            self.func_spatial = self.skip
+        # spatial attention
+        if kernel_size > 1:
+            self.fc_spatial = nn.Conv2d(attn_ch, kernel_size * kernel_size, 1)
         else:
-            self.spatial_fc = nn.Conv2d(attention_channel, kernel_size * kernel_size, 1, bias=True)
-            self.func_spatial = self.get_spatial_attention
+            self.fc_spatial = None
 
-        if kernel_num == 1:
-            self.func_kernel = self.skip
+        # kernel attention
+        if kernel_num > 1:
+            self.fc_kernel = nn.Conv2d(attn_ch, kernel_num, 1)
         else:
-            self.kernel_fc = nn.Conv2d(attention_channel, kernel_num, 1, bias=True)
-            self.func_kernel = self.get_kernel_attention
+            self.fc_kernel = None
 
-        self._initialize_weights()
+        self.init_weights()
 
-    def _initialize_weights(self):
+    def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            if isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
-    def update_temperature(self, temperature):
-        self.temperature = temperature
-
-    @staticmethod
-    def skip(_):
-        return 1.0
-
-    def get_channel_attention(self, x):
-        channel_attention = torch.sigmoid(self.channel_fc(x).view(x.size(0), -1, 1, 1) / self.temperature)
-        return channel_attention
-
-    def get_filter_attention(self, x):
-        filter_attention = torch.sigmoid(self.filter_fc(x).view(x.size(0), -1, 1, 1) / self.temperature)
-        return filter_attention
-
-    def get_spatial_attention(self, x):
-        spatial_attention = self.spatial_fc(x).view(x.size(0), 1, 1, 1, self.kernel_size, self.kernel_size)
-        spatial_attention = torch.sigmoid(spatial_attention / self.temperature)
-        return spatial_attention
-
-    def get_kernel_attention(self, x):
-        kernel_attention = self.kernel_fc(x).view(x.size(0), -1, 1, 1, 1, 1)
-        kernel_attention = F.softmax(kernel_attention / self.temperature, dim=1)
-        return kernel_attention
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        x = self.avgpool(x)
-        x = self.fc(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        return self.func_channel(x), self.func_filter(x), self.func_spatial(x), self.func_kernel(x)
+        x = self.avg(x)
+        x = self.relu(self.bn(self.fc1(x)))
+
+        # channel attn
+        ch = torch.sigmoid(self.fc_channel(x) / (self.temperature * 2))
+        ch = torch.clamp(ch, 0.01, 0.99)  # prevent explode
+
+        # filter attn
+        if self.fc_filter is None:
+            fl = 1.0
+        else:
+            fl = torch.sigmoid(self.fc_filter(x) / (self.temperature * 2))
+            fl = torch.clamp(fl, 0.01, 0.99)
+
+        # spatial attn
+        if self.fc_spatial is None:
+            sp = 1.0
+        else:
+            sp = self.fc_spatial(x)
+            sp = sp.view(x.size(0), 1, 1, 1, self.kernel_size, self.kernel_size)
+            sp = torch.sigmoid(sp / (self.temperature * 2))
+            sp = torch.clamp(sp, 0.01, 0.99)
+
+        # kernel attn
+        if self.fc_kernel is None:
+            ke = 1.0
+        else:
+            ke = self.fc_kernel(x)
+            ke = ke.view(x.size(0), self.kernel_num, 1, 1, 1, 1)
+            ke = F.softmax(ke / (self.temperature * 2), dim=1)
+
+        return ch, fl, sp, ke
 
 
+# ============================
+# STABLE ODConv2d
+# ============================
 class ODConv2d(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1,
-                 reduction=0.0625, kernel_num=4):
-        super(ODConv2d, self).__init__()
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, reduction=0.0625, kernel_num=4):
+        super().__init__()
+
         self.in_planes = in_planes
         self.out_planes = out_planes
         self.kernel_size = kernel_size
+        self.kernel_num = kernel_num
+        self.groups = groups
         self.stride = stride
         self.padding = padding
         self.dilation = dilation
-        self.groups = groups
-        self.kernel_num = kernel_num
-        self.attention = Attention(in_planes, out_planes, kernel_size, groups=groups,
-                                   reduction=reduction, kernel_num=kernel_num)
-        self.weight = nn.Parameter(torch.randn(kernel_num, out_planes, in_planes//groups, kernel_size, kernel_size),
-                                   requires_grad=True)
-        self._initialize_weights()
 
-        if self.kernel_size == 1 and self.kernel_num == 1:
-            self._forward_impl = self._forward_impl_pw1x
-        else:
-            self._forward_impl = self._forward_impl_common
+        self.attn = Attention(in_planes, out_planes, kernel_size,
+                              groups=groups, reduction=reduction, kernel_num=kernel_num)
 
-    def _initialize_weights(self):
-        for i in range(self.kernel_num):
-            nn.init.kaiming_normal_(self.weight[i], mode='fan_out', nonlinearity='relu')
-
-    def update_temperature(self, temperature):
-        self.attention.update_temperature(temperature)
-
-    def _forward_impl_common(self, x):
-        # Multiplying channel attention (or filter attention) to weights and feature maps are equivalent,
-        # while we observe that when using the latter method the models will run faster with less gpu memory cost.
-        channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(x)
-        batch_size, in_planes, height, width = x.size()
-        x = x * channel_attention
-        x = x.reshape(1, -1, height, width)
-        aggregate_weight = spatial_attention * kernel_attention * self.weight.unsqueeze(dim=0)
-        aggregate_weight = torch.sum(aggregate_weight, dim=1).view(
-            [-1, self.in_planes // self.groups, self.kernel_size, self.kernel_size])
-        output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
-                          dilation=self.dilation, groups=self.groups * batch_size)
-        output = output.view(batch_size, self.out_planes, output.size(-2), output.size(-1))
-        output = output * filter_attention
-        return output
-
-    def _forward_impl_pw1x(self, x):
-        channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(x)
-        x = x * channel_attention
-        output = F.conv2d(x, weight=self.weight.squeeze(dim=0), bias=None, stride=self.stride, padding=self.padding,
-                          dilation=self.dilation, groups=self.groups)
-        output = output * filter_attention
-        return output
+        # weights (scaled)
+        self.weight = nn.Parameter(
+            torch.randn(kernel_num, out_planes, in_planes // groups, kernel_size, kernel_size) * 0.05
+        )
 
     def forward(self, x):
-        return self._forward_impl(x)
+        B, C, H, W = x.size()
+
+        ch, fl, sp, ke = self.attn(x)
+
+        # channel apply
+        x = x * ch
+
+        x = x.reshape(1, B * C, H, W)
+
+        # dynamic weight fusion
+        if isinstance(sp, float) and isinstance(ke, float):
+            # simple case (1x1conv)
+            agg_w = self.weight[0]
+        else:
+            agg_w = sp * ke * self.weight.unsqueeze(0)
+            agg_w = agg_w.sum(1)  # sum kernels
+            agg_w = agg_w / self.kernel_num  # normalize scale
+
+        agg_w = agg_w.view(B * self.out_planes,
+                           self.in_planes // self.groups,
+                           self.kernel_size,
+                           self.kernel_size)
+
+        # conv
+        out = F.conv2d(
+            x, agg_w, stride=self.stride, padding=self.padding,
+            dilation=self.dilation, groups=self.groups * B
+        )
+
+        out = out.view(B, self.out_planes, out.size(-2), out.size(-1))
+
+        # filter attention
+        if not isinstance(fl, float):
+            out = out * fl
+
+        return out
